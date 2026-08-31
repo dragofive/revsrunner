@@ -1,0 +1,71 @@
+# custom-ios-runner
+#
+# Codemagic clones THIS repo for every Custom Builds iOS job. Unlike the
+# constructor's ios-template (a fixed Capacitor WebView shell), this runner
+# builds the USER's OWN project: the RevsApp backend fires POST /builds with
+# workflowId: custom-ios and an environment.variables payload carrying
+#
+#   * REVS_SOURCE_URL      - presigned GET for the user's uploaded project ZIP
+#   * REVS_PROJECT_TYPE    - flutter | react_native | expo | capacitor | ios
+#   * REVS_BUILD_CONFIG    - JSON detection markers (root path, etc.)
+#   * APP_STORE_CONNECT_*  - the tenant's .p8 + key id + issuer id (signing)
+#   * BUNDLE_ID / TEAM_ID  - the tenant's Apple identity
+#   * REVS_BACKEND_URL / REVS_WEBHOOK_TOKEN / REVS_BUILD_ID - the callback
+#
+# Nothing tenant-specific is committed here; every input arrives per-build as an
+# env-var, so one runner repo serves every user. Signing is autopilot WITHOUT
+# revoking the user's existing certificates (REVS_NO_REVOKE=1).
+
+workflows:
+  custom-ios:
+    name: RevsApp Custom iOS
+    max_build_duration: 90
+    instance_type: mac_mini_m2
+    environment:
+      xcode: latest
+      cocoapods: default
+      # Node for RN / Expo / Capacitor; Flutter for flutter projects. Both are
+      # preinstalled on Codemagic mac images; declaring them pins versions.
+      node: 22
+      flutter: stable
+    scripts:
+      - name: Sanity-check required env-vars
+        script: |
+          set -e
+          for v in BUNDLE_ID TEAM_ID \
+                   APP_STORE_CONNECT_KEY_IDENTIFIER \
+                   APP_STORE_CONNECT_ISSUER_ID \
+                   APP_STORE_CONNECT_PRIVATE_KEY \
+                   REVS_BACKEND_URL REVS_WEBHOOK_TOKEN REVS_BUILD_ID \
+                   REVS_SOURCE_URL; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Missing required env-var: $v"
+              exit 1
+            fi
+          done
+
+      - name: Make scripts executable
+        script: chmod +x scripts/*.sh
+
+      - name: Download and unpack the user's project source
+        script: ./scripts/download-source.sh
+
+      - name: Fetch App Store Connect signing files (no revoke)
+        script: ./scripts/sign.sh
+
+      - name: Build the .ipa
+        script: ./scripts/build.sh
+
+    artifacts:
+      # build.sh normalizes the output into build/ios/ipa/, but Flutter and some
+      # native setups drop it elsewhere, so also glob the tree as a fallback.
+      - build/ios/ipa/*.ipa
+      - "**/*.ipa"
+      - /tmp/xcodebuild_logs/*.log
+
+    publishing:
+      # Runs with `when: always` semantics (post-build), so the backend is always
+      # told the outcome and no CustomBuild row is ever stranded 'building'.
+      scripts:
+        - ./scripts/notify-backend.sh
+        
