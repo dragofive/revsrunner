@@ -20,6 +20,7 @@ set -uo pipefail
 : "${CM_ARTIFACT_LINKS:=}"
 : "${CM_BUILD_STATUS:=}"
 : "${CM_BUILD_ID:=}"
+: "${REVS_PUBLISH_TARGET:=none}"
 
 if [ -z "${REVS_BACKEND_URL:-}" ] || \
    [ -z "${REVS_WEBHOOK_TOKEN:-}" ] || \
@@ -66,10 +67,20 @@ PY
 
 if [ -n "$LOCAL_IPA" ] || [ "$HAS_IPA" = "yes" ]; then
   STATUS="success"
+  # For a publish build (TestFlight / App Store), a built .ipa is not the whole
+  # story: the upload+submit runs in the publishing block AFTER the build. If
+  # Codemagic's overall status is an EXPLICIT failure, the submission failed even
+  # though the .ipa exists - report failed so the user is not told it shipped
+  # when it did not. An empty/unknown status stays success (no false negatives).
+  if [ "${REVS_PUBLISH_TARGET}" != "none" ]; then
+    case "${CM_BUILD_STATUS:-}" in
+      failed|failure|error) STATUS="failed" ;;
+    esac
+  fi
 elif [ "${CM_BUILD_STATUS:-}" = "canceled" ] || [ "${CM_BUILD_STATUS:-}" = "cancelled" ]; then
   STATUS="canceled"
 fi
-echo "-> Resolved STATUS = '$STATUS'"
+echo "-> Resolved STATUS = '$STATUS' (publish_target=${REVS_PUBLISH_TARGET})"
 
 # Mine the .ipa secure filename out of CM_ARTIFACT_LINKS (the URLs there need the
 # Codemagic API token to download; the backend mints a real public URL itself).
@@ -101,7 +112,12 @@ echo "-> ARTIFACT_FILENAME = '${ARTIFACT_FILENAME:-<none>}'"
 
 ERROR_MSG=""
 if [ "$STATUS" != "success" ]; then
-  ERROR_MSG="Codemagic build $STATUS (build id ${CM_BUILD_ID:-unknown})"
+  if [ "${REVS_PUBLISH_TARGET}" != "none" ] && [ -n "$LOCAL_IPA" ]; then
+    # Built fine but the App Store Connect upload/submit failed.
+    ERROR_MSG="Build succeeded but App Store Connect publishing failed (build id ${CM_BUILD_ID:-unknown})"
+  else
+    ERROR_MSG="Codemagic build $STATUS (build id ${CM_BUILD_ID:-unknown})"
+  fi
 fi
 
 PAYLOAD=$(REVS_BUILD_ID="$REVS_BUILD_ID" \
