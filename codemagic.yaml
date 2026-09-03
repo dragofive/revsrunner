@@ -2,12 +2,13 @@
 #
 # Codemagic clones THIS repo for every Custom Builds iOS job. Unlike the
 # constructor's ios-template (a fixed Capacitor WebView shell), this runner
-# builds the USER's OWN project: the RevsApp backend fires POST /builds with
-# workflowId: custom-ios and an environment.variables payload carrying
+# builds the USER's OWN project: the RevsApp backend fires POST /builds with a
+# workflowId and an environment.variables payload carrying
 #
 #   * REVS_SOURCE_URL      - presigned GET for the user's uploaded project ZIP
 #   * REVS_PROJECT_TYPE    - flutter | react_native | expo | capacitor | ios
 #   * REVS_BUILD_CONFIG    - JSON detection markers (root path, etc.)
+#   * REVS_PUBLISH_TARGET  - none | testflight | appstore (for logging/notify)
 #   * APP_STORE_CONNECT_*  - the tenant's .p8 + key id + issuer id (signing)
 #   * BUNDLE_ID / TEAM_ID  - the tenant's Apple identity
 #   * REVS_BACKEND_URL / REVS_WEBHOOK_TOKEN / REVS_BUILD_ID - the callback
@@ -15,57 +16,123 @@
 # Nothing tenant-specific is committed here; every input arrives per-build as an
 # env-var, so one runner repo serves every user. Signing is autopilot WITHOUT
 # revoking the user's existing certificates (REVS_NO_REVOKE=1).
+#
+# THREE workflows share the exact same build+sign steps (via YAML anchors):
+#   * custom-ios            - build a signed .ipa and hand it back (no upload)
+#   * custom-ios-testflight - same build, then upload + submit to TestFlight
+#   * custom-ios-appstore   - same build, then upload + submit to App Store review
+# The backend picks the workflow by publish_target. Uploading/submitting is done
+# by Codemagic's built-in `publishing.app_store_connect` block (NOT the CLI we
+# call in scripts, which is only for signing). Preconditions for the publish
+# variants: the App Store Connect app record with this Bundle ID must already
+# exist; for App Store review the version metadata must be filled in beforehand.
+
+definitions:
+  environment: &custom_ios_env
+    xcode: latest
+    cocoapods: default
+    # Node for RN / Expo / Capacitor; Flutter for flutter projects. Both are
+    # preinstalled on Codemagic mac images; declaring them pins versions.
+    node: 22
+    flutter: stable
+
+  scripts: &custom_ios_scripts
+    - name: Sanity-check required env-vars
+      script: |
+        set -e
+        for v in BUNDLE_ID TEAM_ID \
+                 APP_STORE_CONNECT_KEY_IDENTIFIER \
+                 APP_STORE_CONNECT_ISSUER_ID \
+                 APP_STORE_CONNECT_PRIVATE_KEY \
+                 REVS_BACKEND_URL REVS_WEBHOOK_TOKEN REVS_BUILD_ID \
+                 REVS_SOURCE_URL; do
+          if [ -z "${!v}" ]; then
+            echo "::error::Missing required env-var: $v"
+            exit 1
+          fi
+        done
+
+    - name: Make scripts executable
+      script: chmod +x scripts/*.sh
+
+    - name: Download and unpack the user's project source
+      script: ./scripts/download-source.sh
+
+    - name: Fetch App Store Connect signing files (no revoke)
+      script: ./scripts/sign.sh
+
+    - name: Build the .ipa
+      script: ./scripts/build.sh
+
+  artifacts: &custom_ios_artifacts
+    # build.sh normalizes the output into build/ios/ipa/, but Flutter and some
+    # native setups drop it elsewhere, so also glob the tree as a fallback.
+    - build/ios/ipa/*.ipa
+    - "**/*.ipa"
+    - /tmp/xcodebuild_logs/*.log
+
+# NOTE: the App Store Connect api_key/key_id/issuer_id trio is repeated inline in
+# each publish workflow below rather than merged from an anchor - Codemagic's YAML
+# parser is not guaranteed to support merge keys (<<:), and its publisher config
+# validator REQUIRES an explicit key here (it will not fall back to the env-vars
+# on its own, even though codemagic-cli-tools reads the same trio for signing).
 
 workflows:
+  # --- Build only: sign the .ipa and hand it back, never upload. ---------------
   custom-ios:
     name: RevsApp Custom iOS
     max_build_duration: 90
     instance_type: mac_mini_m2
-    environment:
-      xcode: latest
-      cocoapods: default
-      # Node for RN / Expo / Capacitor; Flutter for flutter projects. Both are
-      # preinstalled on Codemagic mac images; declaring them pins versions.
-      node: 22
-      flutter: stable
-    scripts:
-      - name: Sanity-check required env-vars
-        script: |
-          set -e
-          for v in BUNDLE_ID TEAM_ID \
-                   APP_STORE_CONNECT_KEY_IDENTIFIER \
-                   APP_STORE_CONNECT_ISSUER_ID \
-                   APP_STORE_CONNECT_PRIVATE_KEY \
-                   REVS_BACKEND_URL REVS_WEBHOOK_TOKEN REVS_BUILD_ID \
-                   REVS_SOURCE_URL; do
-            if [ -z "${!v}" ]; then
-              echo "::error::Missing required env-var: $v"
-              exit 1
-            fi
-          done
-
-      - name: Make scripts executable
-        script: chmod +x scripts/*.sh
-
-      - name: Download and unpack the user's project source
-        script: ./scripts/download-source.sh
-
-      - name: Fetch App Store Connect signing files (no revoke)
-        script: ./scripts/sign.sh
-
-      - name: Build the .ipa
-        script: ./scripts/build.sh
-
-    artifacts:
-      # build.sh normalizes the output into build/ios/ipa/, but Flutter and some
-      # native setups drop it elsewhere, so also glob the tree as a fallback.
-      - build/ios/ipa/*.ipa
-      - "**/*.ipa"
-      - /tmp/xcodebuild_logs/*.log
-
+    environment: *custom_ios_env
+    scripts: *custom_ios_scripts
+    artifacts: *custom_ios_artifacts
     publishing:
       # Runs with `when: always` semantics (post-build), so the backend is always
       # told the outcome and no CustomBuild row is ever stranded 'building'.
+      scripts:
+        - ./scripts/notify-backend.sh
+
+  # --- Build + upload + submit to TestFlight beta review. ----------------------
+  custom-ios-testflight:
+    name: RevsApp Custom iOS - TestFlight
+    max_build_duration: 90
+    instance_type: mac_mini_m2
+    environment: *custom_ios_env
+    scripts: *custom_ios_scripts
+    artifacts: *custom_ios_artifacts
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        # Upload the .ipa and submit it to TestFlight beta review
+        # (post-processing, doesn't consume build minutes).
+        submit_to_testflight: true
+        expire_build_submitted_for_review: true
+      scripts:
+        - ./scripts/notify-backend.sh
+
+  # --- Build + upload + submit to App Store review. ----------------------------
+  custom-ios-appstore:
+    name: RevsApp Custom iOS - App Store
+    max_build_duration: 90
+    instance_type: mac_mini_m2
+    environment: *custom_ios_env
+    scripts: *custom_ios_scripts
+    artifacts: *custom_ios_artifacts
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        # Upload the .ipa and submit the version to App Store review. Requires the
+        # version's metadata (screenshots/description/export compliance) to be
+        # filled in App Store Connect before Apple accepts the submission.
+        # release_type is a literal MANUAL: Codemagic's validator rejects an
+        # env-var here (it wants a literal enum or a ${{ inputs.* }} expression).
+        submit_to_app_store: true
+        cancel_previous_submissions: true
+        release_type: MANUAL
       scripts:
         - ./scripts/notify-backend.sh
         
