@@ -92,14 +92,53 @@ else
   exit 1
 fi
 
-# Pick the first scheme listed under "Schemes:" from `xcodebuild -list`.
-SCHEME=$(printf "%s\n" "$LIST" | awk '/Schemes:/{f=1;next} f&&NF{sub(/^[ \t]+/,"");print;exit}')
-if [ -z "${SCHEME:-}" ]; then
+# Collect every scheme listed under "Schemes:" from `xcodebuild -list` (portable
+# to bash 3.2 on macOS: no mapfile).
+SCHEME_LIST=()
+while IFS= read -r s; do
+  [ -n "$s" ] && SCHEME_LIST+=("$s")
+done < <(printf "%s\n" "$LIST" | awk '/Schemes:/{f=1;next} f{if(NF){sub(/^[ \t]+/,"");print}else{exit}}')
+
+# Choosing the RIGHT scheme matters: a project that pulls SwiftPM packages also
+# exposes their auto-generated schemes (e.g. "AppMetrica-Package"). Picking one
+# of those makes xcodebuild build the dependency across all platforms (incl.
+# DriverKit), which fails with bogus "module 'Swift'/'Foundation' not found".
+# Preference order:
+#   1) explicit scheme from the build config (future UI escape hatch),
+#   2) a scheme named after the container (the app scheme is nearly always
+#      "<Project>", e.g. Lumina.xcodeproj -> "Lumina"),
+#   3) the first scheme that is not a package/test scheme,
+#   4) last resort: the first scheme listed.
+CONTAINER_BASE=$(basename "$CONTAINER"); CONTAINER_BASE="${CONTAINER_BASE%.*}"
+SCHEME=""
+
+HINT=$(python3 -c "import json,os;c=json.loads(os.environ.get('REVS_BUILD_CONFIG') or '{}');print(c.get('scheme') or '')" 2>/dev/null || true)
+if [ -n "$HINT" ]; then
+  SCHEME="$HINT"
+fi
+if [ -z "$SCHEME" ]; then
+  for s in "${SCHEME_LIST[@]}"; do
+    if [ "$s" = "$CONTAINER_BASE" ]; then SCHEME="$s"; break; fi
+  done
+fi
+if [ -z "$SCHEME" ]; then
+  for s in "${SCHEME_LIST[@]}"; do
+    case "$s" in
+      *-Package|*Tests|*UITests) continue ;;
+    esac
+    SCHEME="$s"; break
+  done
+fi
+if [ -z "$SCHEME" ] && [ "${#SCHEME_LIST[@]}" -gt 0 ]; then
+  SCHEME="${SCHEME_LIST[0]}"
+fi
+if [ -z "$SCHEME" ]; then
   echo "::error::Could not determine an Xcode scheme"
   echo "$LIST"
   exit 1
 fi
 echo "-> Container: $CONTAINER"
+echo "-> Available schemes: ${SCHEME_LIST[*]:-<none>}"
 echo "-> Scheme: $SCHEME"
 
 # --- Apply profiles + build the signed ipa. -----------------------------------
