@@ -32,10 +32,12 @@
 # explicitly with exactly one certificate id. Persisting the key fixes the
 # accumulation; explicit profile creation fixes the 500. Both are needed.
 #
-# AUTOPILOT WITHOUT REVOKE. Unlike the constructor's ios-template, this script
-# NEVER calls "app-store-connect certificates delete". A Custom Builds tenant
-# brings their own Apple account and may be signing with those certificates
-# outside RevsApp; revoking is a one-way action on someone else's property.
+# AUTOPILOT WITHOUT REVOKE. This script NEVER calls
+# "app-store-connect certificates delete", on either plane: the same file is
+# deployed byte for byte in custom-ios-runner and in the constructor's
+# ios-template, so do not reintroduce revocation in either copy. A tenant brings
+# their own Apple account and may be signing with those certificates outside
+# RevsApp; revoking is a one-way action on someone else's property.
 # Deleting a provisioning PROFILE that we created ourselves is a different
 # thing and is explained at the point where it happens.
 #
@@ -46,6 +48,17 @@
 # readable by any process and gets printed by tracebacks). Every reference uses
 # the documented "@env:NAME" form, which passes the variable NAME, not its value.
 set -eu
+
+# Neutralise the one flag this script sets for itself (REVS_JSON_A_STDIN, see the
+# JSON helper below). It is meant to be armed only as a command prefix on the
+# single call site that also supplies the pipe, and a command-prefix assignment
+# cannot escape that command. What it CANNOT defend against on its own is an
+# AMBIENT variable of the same name arriving from outside (a stray Codemagic
+# build variable, a wrapper script, the POST /builds payload): that would arm the
+# stdin path for helper calls that pipe nothing, which at best resolves nothing
+# and at worst blocks until Codemagic's timeout kills the build. Unsetting it
+# here means the flag can only ever come from the one line that sets it.
+unset REVS_JSON_A_STDIN 2>/dev/null || true
 
 # codemagic-cli-tools dumps the request and response of a failed Apple API call
 # into a folder under the system temp dir. On macOS that is a random per-process
@@ -120,9 +133,67 @@ from datetime import datetime, timedelta, timezone
 # processing; re-mint on the last build before expiry instead.
 EXPIRY_MARGIN_DAYS = 7
 
+# Slot A may be STREAMED THROUGH STDIN instead of the environment, and only when
+# the caller explicitly says so with REVS_JSON_A_STDIN=1 AND the mode asked for
+# is the one mode that streams. WHY: on Unix the environment and argv share one
+# ARG_MAX budget, so handing a large --json payload to this helper in an
+# environment variable makes execve fail with E2BIG, which the shell reports as
+# "Argument list too long" and this helper never even starts. A pipe has no such
+# limit.
+#
+# WHY IT IS OPT-IN AND NEVER THE DEFAULT: a helper that read stdin by habit
+# would block forever at a call site that left stdin attached to the terminal or
+# to an idle pipe, and a hung build is far worse than a skipped cleanup. The flag
+# names a single slot (A) because only one call site is large; slot B always
+# keeps the environment form, so there is nothing to disambiguate.
+#
+# WHY THE MODE GATE ON TOP OF THE FLAG: sign.sh sets the flag as a command prefix
+# on one pipeline, so nothing inside the script can leak it to the other modes,
+# but an AMBIENT variable of that name would arm every mode at once. pick-cert
+# would then read an empty (or worse, an idle) stdin instead of the certificate
+# list, find no certificate while the Apple call itself succeeded, and fall
+# through to the mint branch, creating a brand new distribution certificate on
+# every build. That is exactly the accumulation defect the persistent key exists
+# to remove, and this script is not allowed to undo it by revoking. Binding the
+# flag to the mode that actually supplies the pipe makes that unreachable;
+# together with the "unset" in sign.sh these are two independent guards.
+_MODE = sys.argv[1] if len(sys.argv) > 1 else ""
+STDIN_SLOT = "REVS_JSON_A" if (
+    _MODE == "stale-profiles" and os.environ.get("REVS_JSON_A_STDIN") == "1"
+) else ""
+
+_stdin_cache = None
+
+
+def _read_stdin():
+    # Read once and remember it. The streaming mode asks for slot A only once
+    # today, so this is defensive: a mode that walked the same slot twice (the
+    # way pick-cert and cert-expiry walk A and then B) would otherwise get ""
+    # from the second read of an already drained pipe and silently change the
+    # answer.
+    global _stdin_cache
+    if _stdin_cache is None:
+        try:
+            # Decode the bytes here with errors="replace" rather than trusting
+            # the process locale. The runner can come up under a C locale, where
+            # text-mode stdin is ASCII, and one odd byte in some unrelated
+            # profile's name would then raise and cost us the whole payload.
+            # os.environ is lenient in the same way, so both slots behave alike.
+            stream = getattr(sys.stdin, "buffer", None)
+            if stream is not None:
+                _stdin_cache = stream.read().decode("utf-8", "replace")
+            else:
+                _stdin_cache = sys.stdin.read()
+        except Exception:
+            _stdin_cache = ""
+    return _stdin_cache
+
 
 def resources(env_name):
-    raw = (os.environ.get(env_name) or "").strip()
+    if env_name and env_name == STDIN_SLOT:
+        raw = _read_stdin().strip()
+    else:
+        raw = (os.environ.get(env_name) or "").strip()
     if not raw:
         return []
     data = None
@@ -319,7 +390,7 @@ MODES = {
     "stale-profiles": stale_profiles,
 }
 
-mode = MODES.get(sys.argv[1] if len(sys.argv) > 1 else "")
+mode = MODES.get(_MODE)
 result = ""
 if mode is not None:
     try:
@@ -356,8 +427,14 @@ CERTS_LEGACY=$(app-store-connect certificates list \
   --certificate-key @env:CERTIFICATE_PRIVATE_KEY \
   --json) || CERT_LIST_RC=$?
 
+# EVERY non-streaming helper call gets "</dev/null". The helper reads stdin only
+# when it is explicitly told to and only in the one streaming mode, so this is
+# redundant today; it is here so that "this call can never block" holds without
+# depending on the environment or on a future edit to the helper, and it costs
+# nothing. The single streaming call site at the bottom of the script is the one
+# place that keeps its stdin, because there it carries the payload.
 CERT_ID=$(REVS_JSON_A="$CERTS_IOS" REVS_JSON_B="$CERTS_LEGACY" \
-  python3 "$SIGN_PY" pick-cert)
+  python3 "$SIGN_PY" pick-cert </dev/null)
 
 # Whichever payload described the certificate we end up using, so the expiry
 # below is read from the same answer the choice was made on.
@@ -384,7 +461,7 @@ else
     --type IOS_DISTRIBUTION \
     --certificate-key @env:CERTIFICATE_PRIVATE_KEY \
     --json) || fail cert_create_failed "app-store-connect certificates create failed"
-  CERT_ID=$(REVS_JSON_A="$CERT_CREATED" python3 "$SIGN_PY" first-id)
+  CERT_ID=$(REVS_JSON_A="$CERT_CREATED" python3 "$SIGN_PY" first-id </dev/null)
   [ -n "$CERT_ID" ] || fail cert_create_failed "certificates create returned no resource id"
   echo "-> Created certificate $CERT_ID"
   CERT_JSON_A="$CERT_CREATED"
@@ -396,7 +473,7 @@ fi
 # .ipa must never be failed over a status line. Nothing here is a secret, see
 # SIGN_CERT_FILE above.
 CERT_EXPIRES_AT=$(REVS_JSON_A="$CERT_JSON_A" REVS_JSON_B="$CERT_JSON_B" \
-  REVS_CERT_ID="$CERT_ID" python3 "$SIGN_PY" cert-expiry)
+  REVS_CERT_ID="$CERT_ID" python3 "$SIGN_PY" cert-expiry </dev/null)
 printf '%s\n%s\n' "$CERT_ID" "$CERT_EXPIRES_AT" > "$SIGN_CERT_FILE" 2>/dev/null || true
 echo "-> Certificate $CERT_ID expires ${CERT_EXPIRES_AT:-<unknown>}"
 
@@ -430,7 +507,7 @@ BUNDLE_IDS=$(app-store-connect bundle-ids list \
   --strict-match-identifier \
   --json) || BUNDLE_LIST_RC=$?
 BUNDLE_ID_RESOURCE=$(REVS_JSON_A="$BUNDLE_IDS" REVS_BUNDLE_ID="$BUNDLE_ID" \
-  python3 "$SIGN_PY" pick-bundle-id)
+  python3 "$SIGN_PY" pick-bundle-id </dev/null)
 
 if [ -z "$BUNDLE_ID_RESOURCE" ]; then
   if [ "$BUNDLE_LIST_RC" -ne 0 ]; then
@@ -448,7 +525,7 @@ if [ -z "$BUNDLE_ID_RESOURCE" ]; then
     --platform IOS \
     --json) || BUNDLE_CREATED=""
   if [ -n "$BUNDLE_CREATED" ]; then
-    BUNDLE_ID_RESOURCE=$(REVS_JSON_A="$BUNDLE_CREATED" python3 "$SIGN_PY" first-id)
+    BUNDLE_ID_RESOURCE=$(REVS_JSON_A="$BUNDLE_CREATED" python3 "$SIGN_PY" first-id </dev/null)
   fi
   if [ -z "$BUNDLE_ID_RESOURCE" ]; then
     # Most likely cause of a failed create: the identifier exists and the strict
@@ -460,7 +537,7 @@ if [ -z "$BUNDLE_ID_RESOURCE" ]; then
       --bundle-id-identifier "$BUNDLE_ID" \
       --json || true)
     BUNDLE_ID_RESOURCE=$(REVS_JSON_A="$BUNDLE_IDS_ALL" REVS_BUNDLE_ID="$BUNDLE_ID" \
-      python3 "$SIGN_PY" pick-bundle-id)
+      python3 "$SIGN_PY" pick-bundle-id </dev/null)
   fi
   [ -n "$BUNDLE_ID_RESOURCE" ] || \
     fail bundle_id_failed "could not resolve or register bundle id $BUNDLE_ID"
@@ -486,7 +563,7 @@ PROFILES=$(app-store-connect profiles list \
   --name "$PROFILE_NAME" \
   --json || true)
 PROFILE_MATCH=$(REVS_JSON_A="$PROFILES" REVS_PROFILE_NAME="$PROFILE_NAME" \
-  python3 "$SIGN_PY" pick-profile)
+  python3 "$SIGN_PY" pick-profile </dev/null)
 
 PROFILE_ID=""
 PROFILE_STATE=""
@@ -533,18 +610,69 @@ fi
 # "RevsApp <bundle> " prefix and a state Apple positively reports as INVALID or
 # EXPIRED are touched; anything else, including anything we cannot read, is left
 # alone. Called with "|| true", which also disables "set -e" inside the function.
+#
+# THIS IS THE ONE CALL SITE THAT STREAMS ITS PAYLOAD THROUGH STDIN. It asks for
+# the team's ENTIRE App Store profile collection, which is unbounded and has
+# already been observed at 100 records; pushing that through the environment blew
+# the ARG_MAX budget that the environment shares with argv, the helper died with
+# "Argument list too long", and the cleanup silently never ran. "printf" is a
+# bash builtin, so the payload is not put on an argv either. Every OTHER call
+# site above deliberately keeps the environment form: each of them passes one
+# record or a handful (one certificate list per type, one create response, one
+# bundle id, one profile looked up by exact name), they are nowhere near the
+# limit, and an unnecessary pipe is one more way for a helper to end up waiting
+# on input.
+#
+# THE PAGE SIZE IS NOT A PROBLEM HERE AND THERE IS NO FLAG FOR IT. Checked
+# against the codemagic-cli-tools documentation and source: "profiles list"
+# accepts only --type, --state, --name and --save (plus the generic auth, --json
+# and logging options); there is no page-size and no all-pages flag to use. The
+# library behind it already walks every page by itself, paginating with a
+# per-request page size of 100 and no overall limit and following Apple's "next"
+# link, so the "Found 100 Profiles" line in the build log is the COMPLETE set for
+# this team and merely happens to equal the per-request page size. Narrowing the
+# query with --state was considered and rejected: it takes a single state, so
+# INVALID and EXPIRED would cost two extra Apple round trips for a payload that
+# now costs nothing to pass. Even if a listing were ever truncated the cleanup
+# stays correct and only becomes partial, because it deletes exclusively ids
+# that carry our own prefix and that Apple positively reports as INVALID or
+# EXPIRED; the next build picks up whatever was left.
 cleanup_stale_profiles() {
   ALL_PROFILES=$(app-store-connect profiles list --type IOS_APP_STORE --json) || return 0
-  STALE=$(REVS_JSON_A="$ALL_PROFILES" \
+  STALE=$(printf '%s' "$ALL_PROFILES" | \
+          REVS_JSON_A_STDIN=1 \
           REVS_PROFILE_PREFIX="$PROFILE_PREFIX" \
           REVS_PROFILE_NAME="$PROFILE_NAME" \
           python3 "$SIGN_PY" stale-profiles)
   [ -n "$STALE" ] || return 0
-  echo "$STALE" | while IFS= read -r stale_id; do
+  # BOUNDED PER BUILD. This cleanup never actually executed before the streaming
+  # fix (the helper died with E2BIG), so the first successful run may face the
+  # whole backlog of the era when every build minted its own certificate and left
+  # a profile behind. Each delete is a separate interpreter start, JWT and Apple
+  # round trip, run serially, inside the signing step whose minutes are billed for
+  # Custom Builds. Capping it keeps that time predictable; whatever is left over
+  # is taken by the next build, and with the persistent key new dead profiles now
+  # appear about once a year, so the backlog converges either way.
+  CLEANUP_LIMIT=20
+  CLEANUP_DONE=0
+  CLEANUP_LEFT=0
+  # Fed by a herestring rather than a pipe: a piped "while" runs in a subshell
+  # and the two counters would not survive it. The delete keeps its own
+  # "</dev/null" so it cannot swallow the loop's input.
+  while IFS= read -r stale_id; do
     [ -n "$stale_id" ] || continue
+    if [ "$CLEANUP_DONE" -ge "$CLEANUP_LIMIT" ]; then
+      CLEANUP_LEFT=$((CLEANUP_LEFT + 1))
+      continue
+    fi
     echo "-> Removing our own dead profile $stale_id"
     app-store-connect profiles delete "$stale_id" --ignore-not-found </dev/null || true
-  done
+    CLEANUP_DONE=$((CLEANUP_DONE + 1))
+  done <<< "$STALE"
+  if [ "$CLEANUP_LEFT" -gt 0 ]; then
+    echo "-> Stopped after $CLEANUP_DONE deletions; $CLEANUP_LEFT more dead profile(s) left for the next build"
+  fi
+  return 0
 }
 cleanup_stale_profiles || true
 
