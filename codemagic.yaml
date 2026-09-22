@@ -8,8 +8,17 @@
 #   * REVS_SOURCE_URL      - presigned GET for the user's uploaded project ZIP
 #   * REVS_PROJECT_TYPE    - flutter | react_native | expo | capacitor | ios
 #   * REVS_BUILD_CONFIG    - JSON detection markers (root path, etc.)
-#   * REVS_PUBLISH_TARGET  - none | testflight | appstore (for logging/notify)
+#   * REVS_PUBLISH_TARGET  - none | testflight (for logging/notify)
 #   * APP_STORE_CONNECT_*  - the tenant's .p8 + key id + issuer id (signing)
+#   * CERTIFICATE_PRIVATE_KEY - the project's PERSISTENT distribution private
+#                            key, generated and stored once by the backend.
+#                            scripts/sign.sh REFUSES to run without it (no
+#                            fallback key generation) because generating one per
+#                            build is what made Apple mint a certificate per
+#                            build. Codemagic does NOT mask POST /builds
+#                            variables, so this value must only ever be
+#                            referenced as @env:CERTIFICATE_PRIVATE_KEY and
+#                            never echoed.
 #   * BUNDLE_ID / TEAM_ID  - the tenant's Apple identity
 #   * REVS_BACKEND_URL / REVS_WEBHOOK_TOKEN / REVS_BUILD_ID - the callback
 #
@@ -17,15 +26,34 @@
 # env-var, so one runner repo serves every user. Signing is autopilot WITHOUT
 # revoking the user's existing certificates (REVS_NO_REVOKE=1).
 #
-# THREE workflows share the exact same build+sign steps (via YAML anchors):
+# TWO workflows share the exact same build+sign steps (via YAML anchors):
 #   * custom-ios            - build a signed .ipa and hand it back (no upload)
 #   * custom-ios-testflight - same build, then upload + submit to TestFlight
-#   * custom-ios-appstore   - same build, then upload + submit to App Store review
 # The backend picks the workflow by publish_target. Uploading/submitting is done
 # by Codemagic's built-in `publishing.app_store_connect` block (NOT the CLI we
-# call in scripts, which is only for signing). Preconditions for the publish
-# variants: the App Store Connect app record with this Bundle ID must already
-# exist; for App Store review the version metadata must be filled in beforehand.
+# call in scripts, which is only for signing). Precondition for the TestFlight
+# variant: the App Store Connect app record with this Bundle ID must already exist.
+#
+# A third workflow, custom-ios-appstore (submit_to_app_store), was REMOVED:
+# App Store review submission is no longer offered as a Custom Builds publish
+# target, because a submission also needs version metadata (screenshots,
+# description, export compliance, age rating) that only the tenant can supply in
+# App Store Connect. Tenants ship to TestFlight from here and promote the build
+# to a store release by hand. Do NOT re-add it without re-adding the backend
+# workflow id and the UI option; the backend now rejects publish_target=appstore
+# at the schema, so this file alone cannot bring the feature back.
+#
+# DEPLOY ORDER: BACKEND IMAGE FIRST, THEN PUSH THIS REPO TO revsrunner.
+# Pushing the runner first breaks iOS builds in two ways, and one of them is
+# silent. (1) An old backend does not send CERTIFICATE_PRIVATE_KEY, so every job
+# stops at the sanity check. (2) An old backend still dispatches
+# publish_target=appstore to the workflow id 'custom-ios-appstore', which no
+# longer exists here: Codemagic resolves workflows from the CLONED yaml, so the
+# job dies before any script runs, notify-backend.sh (which lives in that
+# deleted workflow's publishing block) never fires, and the CustomBuild row sits
+# in 'building', holding a concurrency slot, until the backend's timeout sweeper
+# fails it with the wrong reason. The push is a one-liner and the backend needs
+# an image rebuild, so the wrong order is the convenient one. Do not take it.
 
 definitions:
   environment: &custom_ios_env
@@ -40,10 +68,16 @@ definitions:
     - name: Sanity-check required env-vars
       script: |
         set -e
+        # Indirect expansion (${!v}) and the echo below print only the NAME, so
+        # listing a secret here cannot leak its value. CERTIFICATE_PRIVATE_KEY
+        # belongs in this list because sign.sh hard-fails without it: catching
+        # that here costs ten seconds, catching it at the signing step costs the
+        # source download, the unpack and the mac minutes in between.
         for v in BUNDLE_ID TEAM_ID \
                  APP_STORE_CONNECT_KEY_IDENTIFIER \
                  APP_STORE_CONNECT_ISSUER_ID \
                  APP_STORE_CONNECT_PRIVATE_KEY \
+                 CERTIFICATE_PRIVATE_KEY \
                  REVS_BACKEND_URL REVS_WEBHOOK_TOKEN REVS_BUILD_ID \
                  REVS_SOURCE_URL; do
           if [ -z "${!v}" ]; then
@@ -67,15 +101,22 @@ definitions:
   artifacts: &custom_ios_artifacts
     # build.sh normalizes the output into build/ios/ipa/, but Flutter and some
     # native setups drop it elsewhere, so also glob the tree as a fallback.
+    # Nothing from the signing step is collected ON PURPOSE. The .p12 lives
+    # outside CM_BUILD_DIR, and codemagic-cli-tools' failed-request dumps under
+    # /tmp carry the App Store Connect Authorization header, which would become
+    # downloadable by anyone with access to the build. Diagnose signing from the
+    # build log and the error codes sign.sh emits, never from an artifact.
     - build/ios/ipa/*.ipa
     - "**/*.ipa"
     - /tmp/xcodebuild_logs/*.log
 
-# NOTE: the App Store Connect api_key/key_id/issuer_id trio is repeated inline in
-# each publish workflow below rather than merged from an anchor - Codemagic's YAML
-# parser is not guaranteed to support merge keys (<<:), and its publisher config
-# validator REQUIRES an explicit key here (it will not fall back to the env-vars
-# on its own, even though codemagic-cli-tools reads the same trio for signing).
+# NOTE: the App Store Connect api_key/key_id/issuer_id trio is spelled out inline
+# in the publish workflow below rather than merged from an anchor - Codemagic's
+# YAML parser is not guaranteed to support merge keys (<<:), and its publisher
+# config validator REQUIRES an explicit key here (it will not fall back to the
+# env-vars on its own, even though codemagic-cli-tools reads the same trio for
+# signing). The &custom_ios_* anchors above are plain aliases (not merge keys),
+# which Codemagic does handle, and both workflows below still consume all three.
 
 workflows:
   # --- Build only: sign the .ipa and hand it back, never upload. ---------------
@@ -111,28 +152,3 @@ workflows:
         expire_build_submitted_for_review: true
       scripts:
         - ./scripts/notify-backend.sh
-
-  # --- Build + upload + submit to App Store review. ----------------------------
-  custom-ios-appstore:
-    name: RevsApp Custom iOS - App Store
-    max_build_duration: 90
-    instance_type: mac_mini_m2
-    environment: *custom_ios_env
-    scripts: *custom_ios_scripts
-    artifacts: *custom_ios_artifacts
-    publishing:
-      app_store_connect:
-        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
-        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
-        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
-        # Upload the .ipa and submit the version to App Store review. Requires the
-        # version's metadata (screenshots/description/export compliance) to be
-        # filled in App Store Connect before Apple accepts the submission.
-        # release_type is a literal MANUAL: Codemagic's validator rejects an
-        # env-var here (it wants a literal enum or a ${{ inputs.* }} expression).
-        submit_to_app_store: true
-        cancel_previous_submissions: true
-        release_type: MANUAL
-      scripts:
-        - ./scripts/notify-backend.sh
-        

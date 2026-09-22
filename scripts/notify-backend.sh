@@ -12,6 +12,9 @@
 #   REVS_BUILD_ID       - the CustomBuild row id we are reporting on.
 #
 # Posts to /api/custom/ios/webhook a JSON body HMAC-signed with REVS_WEBHOOK_TOKEN.
+# On a failure it also forwards the machine code sign.sh left in
+# /tmp/revs_sign_error as "error_code"; the backend turns the five known codes
+# into a Russian sentence the tenant can act on (app/api/custom_ios_webhook.py).
 # The backend looks the build up by REVS_BUILD_ID, so a replay cannot write into
 # another build's row without that build's key.
 set -uo pipefail
@@ -67,7 +70,7 @@ PY
 
 if [ -n "$LOCAL_IPA" ] || [ "$HAS_IPA" = "yes" ]; then
   STATUS="success"
-  # For a publish build (TestFlight / App Store), a built .ipa is not the whole
+  # For a publish build (TestFlight), a built .ipa is not the whole
   # story: the upload+submit runs in the publishing block AFTER the build. If
   # Codemagic's overall status is an EXPLICIT failure, the submission failed even
   # though the .ipa exists - report failed so the user is not told it shipped
@@ -119,11 +122,61 @@ if [ "$STATUS" != "success" ]; then
     ERROR_MSG="Codemagic build $STATUS (build id ${CM_BUILD_ID:-unknown})"
   fi
 fi
+# ERROR_MSG must stay a STATIC string: the backend writes payload["error"] into
+# custom_builds.error verbatim and renders it to the tenant, so interpolating a
+# build value here would turn it into a user-visible echo.
+
+# sign.sh writes a machine code for the signing failure it hit; the backend maps
+# it to a Russian sentence the tenant can act on ("free a certificate slot",
+# "check the Bundle ID"), which the generic English line above cannot do.
+# Allow-listed to a bare token so a corrupt or truncated file can never inject
+# prose into a field that is rendered to the user, and read with a default so a
+# missing file (every successful build) is not an error under `set -u`.
+SIGN_ERROR_CODE=$(cat /tmp/revs_sign_error 2>/dev/null || true)
+SIGN_ERROR_CODE=$(printf '%s' "${SIGN_ERROR_CODE:-}" | tr -d '\r\n')
+if ! printf '%s' "$SIGN_ERROR_CODE" | grep -qE '^[a-z_]{1,40}$'; then
+  SIGN_ERROR_CODE=""
+fi
+echo "-> SIGN_ERROR_CODE = '${SIGN_ERROR_CODE:-<none>}'"
+
+# sign.sh also leaves the Apple resource id of the certificate this build signed
+# with and its expiry date in /tmp/revs_sign_cert (id on line 1, expiry on line
+# 2). Forwarded so the backend can record WHICH certificate a given .ipa was
+# signed by; the tenant-facing certificate panel is driven by the backend's own
+# live App Store Connect query, so this is history, not the source of truth, and
+# an absent file changes nothing.
+#
+# THE PRIVATE KEY IS NEVER PART OF THIS. Only the id and the date are read, both
+# of which the tenant can already see in their own Apple account, and both are
+# allow-listed below so a truncated or corrupt file can never inject prose into a
+# field the backend stores. Defaults are set up-front for `set -u` on a build
+# that failed before sign.sh ever ran.
+CERT_ID=""
+CERT_EXPIRES_AT=""
+if [ -r /tmp/revs_sign_cert ]; then
+  CERT_ID=$(sed -n '1p' /tmp/revs_sign_cert 2>/dev/null | tr -d '\r\n')
+  CERT_EXPIRES_AT=$(sed -n '2p' /tmp/revs_sign_cert 2>/dev/null | tr -d '\r\n')
+fi
+# Apple resource ids are opaque short alphanumerics; anything else is dropped
+# together with the date, since a date without a trustworthy id says nothing.
+if ! printf '%s' "$CERT_ID" | grep -qE '^[A-Za-z0-9]{1,64}$'; then
+  CERT_ID=""
+  CERT_EXPIRES_AT=""
+fi
+# RFC3339 as Apple returns it ("2027-05-14T09:12:33.000+0000"). An unreadable
+# date degrades to "not reported" rather than to a wrong date.
+if ! printf '%s' "$CERT_EXPIRES_AT" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]{1,24}Z?$'; then
+  CERT_EXPIRES_AT=""
+fi
+echo "-> CERT_ID = '${CERT_ID:-<none>}' expires '${CERT_EXPIRES_AT:-<unknown>}'"
 
 PAYLOAD=$(REVS_BUILD_ID="$REVS_BUILD_ID" \
           STATUS="$STATUS" \
           ARTIFACT_FILENAME="$ARTIFACT_FILENAME" \
           ERROR_MSG="$ERROR_MSG" \
+          SIGN_ERROR_CODE="$SIGN_ERROR_CODE" \
+          CERT_ID="$CERT_ID" \
+          CERT_EXPIRES_AT="$CERT_EXPIRES_AT" \
           CM_BUILD_ID="${CM_BUILD_ID:-}" \
           python3 - <<'PY'
 import json, os
@@ -139,6 +192,21 @@ if os.environ.get("ARTIFACT_FILENAME"):
     out["artifact_secure_filename"] = os.environ["ARTIFACT_FILENAME"]
 if os.environ.get("ERROR_MSG"):
     out["error"] = os.environ["ERROR_MSG"]
+# Only on a non-success report: a stale file from an earlier step must never
+# decorate a build that actually produced an .ipa. The payload is HMAC-signed
+# over the whole body, so an extra field needs no signature change, and the
+# webhook ignores fields it does not know.
+if os.environ["STATUS"] != "success" and os.environ.get("SIGN_ERROR_CODE"):
+    out["error_code"] = os.environ["SIGN_ERROR_CODE"]
+# Reported on ANY status, unlike error_code: a build that signed and then failed
+# to compile still tells us which certificate exists in the tenant's Apple
+# account. The body is HMAC-signed as a whole, so extra keys need no signature
+# change, and the webhook reads the payload as a plain dict and ignores keys it
+# does not know - an older backend is unaffected by these two.
+if os.environ.get("CERT_ID"):
+    out["cert_id"] = os.environ["CERT_ID"]
+    if os.environ.get("CERT_EXPIRES_AT"):
+        out["cert_expires_at"] = os.environ["CERT_EXPIRES_AT"]
 print(json.dumps({k: v for k, v in out.items() if v is not None}))
 PY
 )
