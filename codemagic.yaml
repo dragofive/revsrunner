@@ -68,11 +68,91 @@
 
 definitions:
   environment: &custom_ios_env
-    xcode: latest
+    # Xcode is PINNED here too, and the blast radius of NOT pinning is bigger
+    # here than in the constructor. Read this before changing it.
+    #
+    # WHY PINNED RATHER THAN "latest". This runner compiles the TENANT'S OWN
+    # arbitrary project (scripts/build.sh drives flutter / react_native /
+    # expo / capacitor / plain ios), which is precisely the code we cannot fix
+    # when the toolchain moves under it. On "latest", a single provider-side
+    # image flip breaks an unknown subset of tenants at once, in code we have
+    # neither the right nor the ability to patch, and the only recovery is a
+    # push to this repo. The nastiest case is not even a red build: Apple
+    # requires the UIScene lifecycle for any UIKit app BUILT WITH the iOS 27
+    # SDK, and a tenant project that has not adopted it still compiles, signs,
+    # uploads and passes Apple's processing, then dies at launch with "UIScene
+    # life cycle is required for apps built with this SDK" (Apple TN3187).
+    # Every build green, every app unopenable, no CI signal anywhere.
+    #
+    # WHY 26.6, AND WHY THE SAME NUMBER AS THE CONSTRUCTOR. 26.6 is the only
+    # image validated by a real signed build that reached TestFlight:
+    # Xcode-26.6.app (17F113) on macOS 26.5.1 (build 25F80), 2026-09-23.
+    # Keeping both repos on the SAME image means one deprecation clock instead
+    # of two, and no "works in the constructor, fails here" signing divergence
+    # on top of a scripts/sign.sh that is deliberately byte-identical between
+    # them. One number to bump, one number to test. Never use "edge": it is
+    # allowed to be a beta and is 27.0 today.
+    #
+    # THIS IS A MINOR PIN, NOT AN EXACT ONE. A patch-precise value is
+    # auto-resolved to the latest patch of that minor, and only one patch per
+    # minor is kept on the images, so the patch level floats regardless. Fine:
+    # the hazards being frozen out all live at the major boundary.
+    #
+    # WHAT WOULD FORCE A BUMP.
+    #   1. HARD DEADLINE, around April 2027: App Store Connect stops accepting
+    #      uploads not built with the iOS 27 SDK or later.
+    #   2. Deprecation of the 26.6 image. On mac_mini_m2 an unsupported xcode
+    #      value means builds DO NOT START AT ALL: no script runs, so
+    #      publishing -> notify-backend.sh never fires and the CustomBuild row
+    #      strands in 'building' holding a concurrency slot until the timeout
+    #      sweeper fails it with the wrong reason. Exactly the same silent
+    #      shape as the deploy-order hazard described in the header above.
+    #      Precedent is roughly one month of notice, on a channel nobody here
+    #      currently watches.
+    #   3. A tenant whose project genuinely needs Xcode 27. That case does NOT
+    #      require touching this file: see the per-build override below.
+    #
+    # HOW TO BUMP SAFELY. Do not flip this value as a convenience. Move one
+    # real tenant build to the new version with the override first, confirm
+    # the .ipa both uploads AND launches on a device (a green build proves
+    # nothing about the UIScene bug), then change the default here and expect
+    # to re-run at least one build of every project type build.sh supports.
+    # Keep the value QUOTED: unquoted it is a YAML float, harmless for 26.6
+    # but a future 26.10 would silently parse as 26.1.
+    #
+    # PER-BUILD OVERRIDE: this value is the DEFAULT, not a lock. The tenant's
+    # project, not ours, decides the right toolchain: an old Flutter/RN may
+    # break on a newer Xcode, while an already scene-migrated stack may
+    # specifically want 27, and neither should cost a push to this repo.
+    # Codemagic's POST /builds accepts environment.softwareVersions.xcode,
+    # which overrides the workflow's own setting, so the backend can send a
+    # per-project value and simply send nothing to land on this line, which is
+    # what every existing tenant does today. Backend side is one optional
+    # field on start_build in app/services/builds/codemagic.py plus its call
+    # site in app/services/custom/ios_build.py. The CONSTRUCTOR call site
+    # (app/services/builds/ios.py) must keep sending nothing: that path builds
+    # our own shell and stays non-overridable ON PURPOSE.
+    # NOT PROVEN YET: that softwareVersions wins over a value set in the
+    # cloned yaml is not spelled out in the docs, only over UI settings. Prove
+    # it with one real build before wiring it into the UI or telling tenants
+    # it exists. If it loses, the fallback is a workflow input
+    # (${{ inputs.xcode }} defaulting to "26.6"), which needs the same
+    # one-build proof because input substitution inside the environment block
+    # is equally undocumented. Until one of the two is proven, an override is
+    # an operator action, not a product feature.
+    xcode: "26.6"
     cocoapods: default
     # Node for RN / Expo / Capacitor; Flutter for flutter projects. Both are
-    # preinstalled on Codemagic mac images; declaring them pins versions.
+    # preinstalled on Codemagic mac images. "node: 22" really does pin a
+    # version; "flutter: stable" below does NOT, despite sitting in the same
+    # block. See the note directly above it.
     node: 22
+    # KNOWN GAP, deliberately NOT addressed by the xcode pin above: "stable"
+    # is the same unpinned-upstream risk class that "latest" was, and it moves
+    # on its own. Flutter 3.41 made UIScene the default and auto-migrates
+    # eligible apps, so a stable bump changes tenant build output without any
+    # change here. Pinning it is a separate decision with its own
+    # compatibility matrix per tenant Flutter version, not a rider on this one.
     flutter: stable
 
   scripts: &custom_ios_scripts
