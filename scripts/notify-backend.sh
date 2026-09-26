@@ -151,6 +151,8 @@ if [ "${REVS_PUBLISH_TARGET}" != "none" ] && [ "$STATUS" = "success" ]; then
   PUBLISH_SCAN=$(python3 - <<'PY' 2>/dev/null || true
 import os
 import re
+import stat
+import time
 
 # Separator class absorbs backslashes so a re-escaped copy of Apple's answer
 # (\"previousBundleVersion\": \"13\") matches as well as the plain one.
@@ -159,6 +161,10 @@ PREV = re.compile(r'previousBundleVersion["\\\s:]{1,8}(\d{1,12})')
 MAX_FILES = 4000          # bounded walk: this runs on every publish build
 MAX_BYTES = 4 * 1024 * 1024
 MAX_DEPTH = 5
+# Wall-clock budget for the whole walk. This runs in publishing.scripts, where
+# a hang holds the build machine (billed) until max_build_duration and the
+# backend never hears the verdict (seen 2026-09-26: 17+ minutes here).
+MAX_SECONDS = 60
 
 
 def classify(text):
@@ -192,6 +198,7 @@ def scan():
         if d and os.path.isdir(d) and d not in roots:
             roots.append(d)
     seen = 0
+    deadline = time.monotonic() + MAX_SECONDS
     for root in roots:
         base = root.rstrip("/").count("/")
         for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
@@ -200,13 +207,20 @@ def scan():
                 continue
             for name in filenames:
                 seen += 1
-                if seen > MAX_FILES:
+                if seen > MAX_FILES or time.monotonic() > deadline:
                     return None
                 path = os.path.join(dirpath, name)
                 try:
-                    if os.path.getsize(path) > MAX_BYTES:
+                    # Regular files only. open() on a FIFO blocks until a
+                    # writer appears, and the temp dirs of a build machine do
+                    # hold named pipes; sockets and devices are never dumps.
+                    st = os.lstat(path)
+                    if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
                         continue
-                    with open(path, "rb") as fh:
+                    # O_NONBLOCK as well: if the path is swapped for a FIFO
+                    # between lstat and open, the open still returns at once.
+                    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+                    with os.fdopen(fd, "rb") as fh:
                         blob = fh.read(MAX_BYTES)
                 except OSError:
                     continue
